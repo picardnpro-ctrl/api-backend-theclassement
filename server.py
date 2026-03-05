@@ -47,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # JWT Configuration
-JWT_SECRET = os.environ.get('ADMIN_PASSWORD', 'TheClassement2025!')
+JWT_SECRET = os.environ.get('ADMIN_PASSWORD', 'UnMotDePassePourTonSite2026!')
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
@@ -101,7 +101,7 @@ async def admin_login(request: LoginRequest):
     if db_password:
         admin_password = db_password.get("value")
     else:
-        admin_password = os.environ.get('ADMIN_PASSWORD', 'TheClassement2025!')
+        admin_password = os.environ.get('ADMIN_PASSWORD', 'UnMotDePassePourTonSite2026!')
     
     if not admin_password:
         raise HTTPException(status_code=500, detail="Configuration erreur")
@@ -119,7 +119,7 @@ async def verify_admin(authenticated: bool = Depends(verify_token)):
 @api_router.post("/auth/change-password")
 async def change_admin_password(data: PasswordChange, authenticated: bool = Depends(verify_token)):
     """Change admin password"""
-    admin_password = os.environ.get('ADMIN_PASSWORD', 'TheClassement2025!')
+    admin_password = os.environ.get('ADMIN_PASSWORD', 'UnMotDePassePourTonSite2026!')
     
     # Verify old password
     if data.old_password != admin_password:
@@ -1450,6 +1450,7 @@ _FIXED_ORIGINS = {
     "http://localhost:3000",
     "http://localhost:3001",
     "http://127.0.0.1:3000",
+    "https://palevioletred-grasshopper-749161.hostingersite.com",
 }
 
 _ENV_ORIGINS = {
