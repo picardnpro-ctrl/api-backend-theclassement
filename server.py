@@ -1496,3 +1496,4 @@ app.add_middleware(SmartCORSMiddleware)
 # ── Shutdown propre ───────────────────────────────────────────────────
 import atexit as _atexit
 _atexit.register(lambda: client.close())
+        
