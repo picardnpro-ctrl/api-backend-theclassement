@@ -16,6 +16,7 @@ import re
 import jwt
 import hashlib
 import shutil
+import httpx
 
 ROOT_DIR = Path(__file__).parent
 UPLOAD_DIR = ROOT_DIR / "uploads"
@@ -48,6 +49,52 @@ logger = logging.getLogger(__name__)
 
 # JWT Configuration
 JWT_SECRET = os.environ.get('ADMIN_PASSWORD', 'UnMotDePassePourTonSite2026!')
+
+# Brevo (newsletter)
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
+BREVO_SENDER_EMAIL = os.environ.get('BREVO_SENDER_EMAIL', 'newsletter@theclassement.com')
+BREVO_SENDER_NAME = os.environ.get('BREVO_SENDER_NAME', 'The Classement')
+
+async def send_brevo_email(to_email: str, to_name: str, subject: str, html_content: str):
+    """Envoyer un email via Brevo API"""
+    if not BREVO_API_KEY:
+        logger.warning("BREVO_API_KEY non configurée - email non envoyé")
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "api-key": BREVO_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+                    "to": [{"email": to_email, "name": to_name}],
+                    "subject": subject,
+                    "htmlContent": html_content
+                },
+                timeout=10.0
+            )
+            if response.status_code == 201:
+                logger.info(f"Email envoyé à {to_email}")
+                return True
+            else:
+                logger.error(f"Erreur Brevo {response.status_code}: {response.text}")
+                return False
+    except Exception as e:
+        logger.error(f"Exception Brevo: {e}")
+        return False
+
+async def send_newsletter_to_all(subject: str, html_content: str):
+    """Envoyer newsletter à tous les abonnés actifs"""
+    subscribers = await db.newsletter.find({"is_active": True}, {"_id": 0}).to_list(10000)
+    success_count = 0
+    for sub in subscribers:
+        ok = await send_brevo_email(sub["email"], sub["email"], subject, html_content)
+        if ok:
+            success_count += 1
+    return {"sent": success_count, "total": len(subscribers)}
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 168  # 7 jours
 
@@ -835,6 +882,29 @@ async def subscribe_newsletter(data: NewsletterSubscribe):
         "is_active": True
     }
     await db.newsletter.insert_one(subscription)
+
+    # Email de bienvenue via Brevo
+    welcome_html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #050505; color: #ffffff; padding: 40px;">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #ffffff; font-size: 28px;">THE<span style="color: #0057FF;">CLASSEMENT</span></h1>
+      </div>
+      <h2 style="color: #ffffff;">Bienvenue dans la communauté ! 🎉</h2>
+      <p style="color: #A1A1AA; line-height: 1.6;">
+        Merci de vous être inscrit à la newsletter de TheClassement.<br>
+        Vous recevrez nos meilleurs classements et TOP 10 directement dans votre boîte mail.
+      </p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="https://theclassement.com" style="background: #0057FF; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Découvrir les classements →
+        </a>
+      </div>
+      <p style="color: #71717A; font-size: 12px; text-align: center;">
+        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe?email={data.email.lower()}" style="color: #0057FF;">cliquez ici</a>
+      </p>
+    </div>
+    """
+    await send_brevo_email(data.email.lower(), data.email.lower(), "Bienvenue sur TheClassement ! 🎉", welcome_html)
     
     return {"message": "Inscription réussie ! Merci de votre intérêt.", "success": True}
 
@@ -854,6 +924,45 @@ async def unsubscribe_newsletter(email: str):
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Email non trouvé")
     return {"message": "Désinscription effectuée"}
+
+class NewsletterSend(BaseModel):
+    subject: str
+    html_content: str
+
+@api_router.post("/newsletter/send")
+async def send_newsletter(data: NewsletterSend, authenticated: bool = Depends(verify_token)):
+    """Envoyer une newsletter à tous les abonnés actifs (admin only)"""
+    result = await send_newsletter_to_all(data.subject, data.html_content)
+    return result
+
+@api_router.post("/newsletter/send-article/{article_id}")
+async def send_article_newsletter(article_id: str, authenticated: bool = Depends(verify_token)):
+    """Envoyer un email automatique quand un article est publié"""
+    article = await db.articles.find_one({"id": article_id}, {"_id": 0})
+    if not article:
+        raise HTTPException(status_code=404, detail="Article non trouvé")
+    
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #050505; color: #ffffff; padding: 40px;">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #ffffff; font-size: 28px;">THE<span style="color: #0057FF;">CLASSEMENT</span></h1>
+      </div>
+      <h2 style="color: #ffffff;">Nouveau classement : {article.get('title', '')}</h2>
+      <p style="color: #A1A1AA; line-height: 1.6;">{article.get('excerpt', '')}</p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="https://theclassement.com/article/{article.get('slug', '')}" 
+           style="background: #0057FF; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Voir le classement →
+        </a>
+      </div>
+      <p style="color: #71717A; font-size: 12px; text-align: center;">
+        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe" style="color: #0057FF;">cliquez ici</a>
+      </p>
+    </div>
+    """
+    subject = f"Nouveau TOP 10 : {article.get('title', '')}"
+    result = await send_newsletter_to_all(subject, html)
+    return result
 
 
 # ==================== IMAGE UPLOAD ====================
