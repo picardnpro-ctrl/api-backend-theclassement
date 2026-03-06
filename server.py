@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # JWT Configuration
 JWT_SECRET = os.environ.get('ADMIN_PASSWORD', 'UnMotDePassePourTonSite2026!')
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
+JWT_EXPIRATION_HOURS = 168  # 7 jours
 
 security = HTTPBearer()
 
@@ -1496,4 +1496,3 @@ app.add_middleware(SmartCORSMiddleware)
 # ── Shutdown propre ───────────────────────────────────────────────────
 import atexit as _atexit
 _atexit.register(lambda: client.close())
-        
