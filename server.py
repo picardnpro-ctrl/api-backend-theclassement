@@ -161,20 +161,65 @@ async def send_brevo_email(to_email: str, to_name: str, subject: str, html_conte
         return False
 
 async def send_newsletter_to_all(subject: str, html_content: str):
-    """Envoyer newsletter à tous les abonnés actifs avec lien désinscription personnalisé"""
+    """Envoyer newsletter à tous les abonnés actifs avec lien désinscription personnalisé + tracking ouverture"""
     subscribers = await db.newsletter.find({"is_active": True, "confirmed": True}, {"_id": 0}).to_list(10000)
     success_count = 0
+    total = len(subscribers)
+    
+    # Créer une entrée de campagne pour le tracking
+    import uuid as _uuid
+    campaign_id = str(_uuid.uuid4())[:8]
+    campaign_doc = {
+        "id": campaign_id,
+        "subject": subject,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "recipients": total,
+        "delivered": 0,
+        "opens": 0,
+        "open_rate": 0.0
+    }
+    await db.newsletter_campaigns.insert_one(campaign_doc)
+    
     for sub in subscribers:
         email = sub["email"]
-        # Ajouter lien désinscription personnalisé dans chaque email
+        # ID unique par destinataire pour le tracking
+        email_id = f"{campaign_id}_{email.replace('@','_').replace('.','_')}"
+        
+        # Pixel de tracking ouverture
+        tracking_pixel = f'<img src="https://api-backend-theclassement.onrender.com/api/newsletter/track/open/{email_id}" width="1" height="1" style="display:none;" alt="" />'
+        
+        # Ajouter lien désinscription personnalisé + pixel dans chaque email
         personalized_html = html_content.replace(
             'href="https://theclassement.com/unsubscribe"',
             f'href="https://theclassement.com/unsubscribe?email={email}"'
         )
+        # Injecter le pixel avant </body> ou à la fin du contenu
+        if '</body>' in personalized_html:
+            personalized_html = personalized_html.replace('</body>', tracking_pixel + '</body>')
+        else:
+            personalized_html += tracking_pixel
+        
         ok = await send_brevo_email(email, email, subject, personalized_html)
         if ok:
             success_count += 1
-    return {"sent": success_count, "total": len(subscribers)}
+            # Mettre à jour le compteur de livraison de la campagne
+            await db.newsletter_campaigns.update_one(
+                {"id": campaign_id},
+                {"$inc": {"delivered": 1}}
+            )
+    
+    # Calculer open_rate (sera mis à jour par le pixel tracking plus tard)
+    open_tracking = await db.newsletter_stats.find(
+        {"email_id": {"$regex": f"^{campaign_id}_"}}, {"opens": 1}
+    ).to_list(10000)
+    total_opens = sum(s.get("opens", 0) for s in open_tracking)
+    open_rate = round((total_opens / success_count * 100), 1) if success_count > 0 else 0
+    
+    await db.newsletter_campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"delivered": success_count, "opens": total_opens, "open_rate": open_rate}}
+    )
+    return {"sent": success_count, "total": total, "campaign_id": campaign_id}
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 168  # 7 jours
 
@@ -1024,6 +1069,37 @@ async def get_popular_tops(limit: int = 5):
 
 # ==================== NEWSLETTER ====================
 
+
+@api_router.get("/newsletter/track/open/{email_id}")
+async def track_newsletter_open(email_id: str, request: Request):
+    """Pixel de tracking 1x1 pour mesurer les ouvertures de newsletter"""
+    try:
+        # Incrémenter le compteur d'ouverture pour cet envoi
+        await db.newsletter_stats.update_one(
+            {"email_id": email_id},
+            {
+                "$inc": {"opens": 1},
+                "$set": {"last_opened_at": datetime.now(timezone.utc).isoformat()},
+                "$addToSet": {"opened_emails": request.client.host if request.client else "unknown"}
+            },
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Track open error: {e}")
+    
+    # Retourner pixel transparent 1x1
+    pixel = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    return Response(content=pixel, media_type="image/gif", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache"
+    })
+
+@api_router.get("/newsletter/stats/campaigns")
+async def get_newsletter_campaign_stats(authenticated: bool = Depends(verify_token)):
+    """Statistiques des campagnes newsletter (taux d'ouverture)"""
+    campaigns = await db.newsletter_campaigns.find({}, {"_id": 0}).sort("sent_at", -1).to_list(50)
+    return campaigns
+
 @api_router.post("/newsletter/subscribe")
 async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
     check_rate_limit(request, max_requests=3, window_seconds=300)
@@ -1695,12 +1771,25 @@ async def sitemap():
     <priority>0.9</priority>
   </url>\n'''
     
-    # Dynamic Categories
+    # Dynamic Categories — avec lastmod basé sur l'article le plus récent
     for cat in categories:
+        # Chercher la date du dernier article de cette catégorie
+        last_article = await db.articles.find_one(
+            {"category": cat["slug"], "is_published": True},
+            {"updated_at": 1},
+            sort=[("updated_at", -1)]
+        )
+        lastmod_str = ""
+        if last_article and last_article.get("updated_at"):
+            ua = last_article["updated_at"]
+            if isinstance(ua, datetime):
+                lastmod_str = f"\n    <lastmod>{ua.strftime('%Y-%m-%d')}</lastmod>"
+            else:
+                lastmod_str = f"\n    <lastmod>{str(ua)[:10]}</lastmod>"
         xml_content += f'''  <url>
-    <loc>{SITE_URL}/category/{cat['slug']}</loc>
+    <loc>{SITE_URL}/category/{cat['slug']}</loc>{lastmod_str}
     <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
+    <priority>0.85</priority>
   </url>\n'''
     
     # Top 10 Articles — priorité selon vues et récence
