@@ -17,6 +17,7 @@ import jwt
 import hashlib
 import asyncio
 from collections import defaultdict
+import secrets
 try:
     from PIL import Image
     import io
@@ -97,6 +98,7 @@ async def lifespan(app):
         await db.blog_articles.create_index([("created_at", -1)], background=True)
         await db.newsletter.create_index("email", unique=True, background=True)
         await db.newsletter.create_index("is_active", background=True)
+        await db.newsletter.create_index("confirm_token", background=True)
         logger.info("Index MongoDB créés ✅")
     except Exception as e:
         logger.warning(f"Index MongoDB: {e}")
@@ -160,7 +162,7 @@ async def send_brevo_email(to_email: str, to_name: str, subject: str, html_conte
 
 async def send_newsletter_to_all(subject: str, html_content: str):
     """Envoyer newsletter à tous les abonnés actifs avec lien désinscription personnalisé"""
-    subscribers = await db.newsletter.find({"is_active": True}, {"_id": 0}).to_list(10000)
+    subscribers = await db.newsletter.find({"is_active": True, "confirmed": True}, {"_id": 0}).to_list(10000)
     success_count = 0
     for sub in subscribers:
         email = sub["email"]
@@ -988,35 +990,87 @@ async def get_popular_tops(limit: int = 5):
 @api_router.post("/newsletter/subscribe")
 async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
     check_rate_limit(request, max_requests=3, window_seconds=300)
-    """Subscribe to newsletter"""
-    # Validate email format
+    """Subscribe to newsletter avec double opt-in"""
     email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     if not re.match(email_regex, data.email):
         raise HTTPException(status_code=400, detail="Email invalide")
     
-    # Check if already subscribed
     existing = await db.newsletter.find_one({"email": data.email.lower()})
     if existing:
-        if existing.get("is_active"):
+        if existing.get("is_active") and existing.get("confirmed"):
             return {"message": "Vous êtes déjà inscrit à la newsletter", "already_subscribed": True}
-        else:
-            # Reactivate subscription
+        elif existing.get("is_active") and not existing.get("confirmed"):
+            # Renvoyer email de confirmation
+            token = existing.get("confirm_token", secrets.token_urlsafe(32))
             await db.newsletter.update_one(
-                {"email": data.email.lower()}, 
-                {"$set": {"is_active": True, "subscribed_at": datetime.now(timezone.utc).isoformat()}}
+                {"email": data.email.lower()},
+                {"$set": {"confirm_token": token}}
             )
-            return {"message": "Votre inscription a été réactivée", "reactivated": True}
+            await _send_confirmation_email(data.email.lower(), token)
+            return {"message": "Email de confirmation renvoyé. Vérifiez votre boîte mail.", "pending": True}
+        else:
+            # Réactiver avec nouveau token
+            token = secrets.token_urlsafe(32)
+            await db.newsletter.update_one(
+                {"email": data.email.lower()},
+                {"$set": {"is_active": True, "confirmed": False, "confirm_token": token, "subscribed_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            await _send_confirmation_email(data.email.lower(), token)
+            return {"message": "Un email de confirmation vous a été envoyé.", "success": True}
     
-    # Create new subscription
+    # Nouvelle inscription — en attente de confirmation
+    token = secrets.token_urlsafe(32)
     subscription = {
         "email": data.email.lower(),
         "source": data.source,
         "subscribed_at": datetime.now(timezone.utc).isoformat(),
-        "is_active": True
+        "is_active": True,
+        "confirmed": False,
+        "confirm_token": token
     }
     await db.newsletter.insert_one(subscription)
+    await _send_confirmation_email(data.email.lower(), token)
+    return {"message": "Un email de confirmation vous a été envoyé. Vérifiez votre boîte mail !", "success": True}
 
-    # Email de bienvenue via Brevo
+async def _send_confirmation_email(email: str, token: str):
+    """Envoyer email de confirmation double opt-in"""
+    confirm_url = f"https://theclassement.com/newsletter/confirm?token={token}"
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #050505; color: #ffffff; padding: 40px;">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #ffffff; font-size: 28px;">THE<span style="color: #0057FF;">CLASSEMENT</span></h1>
+      </div>
+      <h2 style="color: #ffffff;">Confirmez votre inscription 📧</h2>
+      <p style="color: #A1A1AA; line-height: 1.6;">
+        Merci de votre intérêt pour la newsletter de The Classement.<br>
+        Cliquez sur le bouton ci-dessous pour confirmer votre inscription.
+      </p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="{confirm_url}" style="background: #0057FF; color: #ffffff; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
+          Confirmer mon inscription →
+        </a>
+      </div>
+      <p style="color: #71717A; font-size: 12px; text-align: center;">
+        Si vous n'avez pas demandé cette inscription, ignorez cet email.<br>
+        Ce lien expire dans 48 heures.
+      </p>
+    </div>
+    """
+    await send_brevo_email(email, email, "Confirmez votre inscription à The Classement", html)
+
+@api_router.get("/newsletter/confirm")
+async def confirm_newsletter(token: str = Query(...)):
+    """Confirmer l'inscription newsletter via double opt-in"""
+    sub = await db.newsletter.find_one({"confirm_token": token})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Lien invalide ou expiré")
+    
+    await db.newsletter.update_one(
+        {"confirm_token": token},
+        {"$set": {"confirmed": True, "confirmed_at": datetime.now(timezone.utc).isoformat()}, "$unset": {"confirm_token": ""}}
+    )
+    
+    # Email de bienvenue après confirmation
     welcome_html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #050505; color: #ffffff; padding: 40px;">
       <div style="text-align: center; margin-bottom: 30px;">
@@ -1024,8 +1078,7 @@ async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
       </div>
       <h2 style="color: #ffffff;">Bienvenue dans la communauté ! 🎉</h2>
       <p style="color: #A1A1AA; line-height: 1.6;">
-        Merci de vous être inscrit à la newsletter de TheClassement.<br>
-        Vous recevrez nos meilleurs classements et TOP 10 directement dans votre boîte mail.
+        Votre inscription est confirmée. Vous recevrez nos meilleurs classements et TOP 10 directement dans votre boîte mail.
       </p>
       <div style="text-align: center; margin: 30px 0;">
         <a href="https://theclassement.com" style="background: #0057FF; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">
@@ -1033,13 +1086,15 @@ async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
         </a>
       </div>
       <p style="color: #71717A; font-size: 12px; text-align: center;">
-        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe?email={data.email.lower()}" style="color: #0057FF; text-decoration: underline;">cliquez ici</a>
+        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe?email={sub['email']}" style="color: #0057FF; text-decoration: underline;">cliquez ici</a>
       </p>
     </div>
     """
-    await send_brevo_email(data.email.lower(), data.email.lower(), "Bienvenue sur TheClassement ! 🎉", welcome_html)
+    await send_brevo_email(sub["email"], sub["email"], "Bienvenue sur The Classement ! 🎉", welcome_html)
     
-    return {"message": "Inscription réussie ! Merci de votre intérêt.", "success": True}
+    # Rediriger vers le site avec message de succès
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="https://theclassement.com/newsletter/confirmed", status_code=302)
 
 @api_router.get("/newsletter/subscribers")
 async def get_newsletter_subscribers(authenticated: bool = Depends(verify_token)):
@@ -1192,7 +1247,7 @@ async def get_stats_overview(authenticated: bool = Depends(verify_token)):
     """Get site statistics overview (admin only)"""
     articles_count = await db.articles.count_documents({})
     blog_count = await db.blog_articles.count_documents({})
-    newsletter_count = await db.newsletter.count_documents({"is_active": True})
+    newsletter_count = await db.newsletter.count_documents({"is_active": True, "confirmed": True})
     
     # Total views
     pipeline = [{"$group": {"_id": None, "total": {"$sum": "$views"}}}]
