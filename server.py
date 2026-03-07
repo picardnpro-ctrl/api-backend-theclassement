@@ -84,6 +84,22 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app):
+    # Créer les index MongoDB pour des requêtes rapides
+    try:
+        await db.articles.create_index("slug", unique=True, background=True)
+        await db.articles.create_index("category", background=True)
+        await db.articles.create_index("is_published", background=True)
+        await db.articles.create_index("is_featured", background=True)
+        await db.articles.create_index([("views", -1)], background=True)
+        await db.blog_articles.create_index("slug", unique=True, background=True)
+        await db.blog_articles.create_index("category", background=True)
+        await db.blog_articles.create_index("is_published", background=True)
+        await db.blog_articles.create_index([("created_at", -1)], background=True)
+        await db.newsletter.create_index("email", unique=True, background=True)
+        await db.newsletter.create_index("is_active", background=True)
+        logger.info("Index MongoDB créés ✅")
+    except Exception as e:
+        logger.warning(f"Index MongoDB: {e}")
     asyncio.create_task(auto_publish_scheduled_articles())
     logger.info("Tâche auto-publication démarrée ✅")
     yield
