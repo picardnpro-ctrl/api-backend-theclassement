@@ -143,11 +143,17 @@ async def send_brevo_email(to_email: str, to_name: str, subject: str, html_conte
         return False
 
 async def send_newsletter_to_all(subject: str, html_content: str):
-    """Envoyer newsletter à tous les abonnés actifs"""
+    """Envoyer newsletter à tous les abonnés actifs avec lien désinscription personnalisé"""
     subscribers = await db.newsletter.find({"is_active": True}, {"_id": 0}).to_list(10000)
     success_count = 0
     for sub in subscribers:
-        ok = await send_brevo_email(sub["email"], sub["email"], subject, html_content)
+        email = sub["email"]
+        # Ajouter lien désinscription personnalisé dans chaque email
+        personalized_html = html_content.replace(
+            'href="https://theclassement.com/unsubscribe"',
+            f'href="https://theclassement.com/unsubscribe?email={email}"'
+        )
+        ok = await send_brevo_email(email, email, subject, personalized_html)
         if ok:
             success_count += 1
     return {"sent": success_count, "total": len(subscribers)}
@@ -1011,7 +1017,7 @@ async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
         </a>
       </div>
       <p style="color: #71717A; font-size: 12px; text-align: center;">
-        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe?email={data.email.lower()}" style="color: #0057FF;">cliquez ici</a>
+        Pour vous désinscrire, <a href="https://theclassement.com/unsubscribe?email={data.email.lower()}" style="color: #0057FF; text-decoration: underline;">cliquez ici</a>
       </p>
     </div>
     """
@@ -1026,8 +1032,19 @@ async def get_newsletter_subscribers(authenticated: bool = Depends(verify_token)
     return {"count": len(subscribers), "subscribers": subscribers}
 
 @api_router.post("/newsletter/unsubscribe")
-async def unsubscribe_newsletter(email: str):
+async def unsubscribe_newsletter(email: str = Query(...)):
     """Unsubscribe from newsletter"""
+    result = await db.newsletter.update_one(
+        {"email": email.lower()},
+        {"$set": {"is_active": False}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Email non trouvé")
+    return {"message": "Désinscription effectuée"}
+
+@api_router.get("/newsletter/unsubscribe")
+async def unsubscribe_newsletter_get(email: str = Query(...)):
+    """Unsubscribe from newsletter via GET (lien email)"""
     result = await db.newsletter.update_one(
         {"email": email.lower()},
         {"$set": {"is_active": False}}
