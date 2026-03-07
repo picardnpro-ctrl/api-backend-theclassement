@@ -7,3 +7,4 @@ python-multipart
 pydantic
 email-validator
 httpx
+Pillow
