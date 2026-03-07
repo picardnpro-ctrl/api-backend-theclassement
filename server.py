@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 import re
 import jwt
 import hashlib
+import asyncio
 import shutil
 import httpx
 
@@ -32,7 +33,34 @@ db = client[os.environ['DB_NAME']]
 # Create the main app without a prefix
 from starlette.middleware.gzip import GZipMiddleware
 
-app = FastAPI()
+async def auto_publish_scheduled_articles():
+    """Publier automatiquement les articles dont la date programmée est passée"""
+    await asyncio.sleep(5)  # Attendre que la DB soit connectée
+    while True:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            result = await db.articles.update_many(
+                {
+                    "is_published": False,
+                    "scheduled_at": {"$ne": None, "$lte": now}
+                },
+                {"$set": {"is_published": True}}
+            )
+            if result.modified_count > 0:
+                logger.info(f"{result.modified_count} article(s) publiés automatiquement")
+        except Exception as e:
+            logger.error(f"Erreur auto-publish: {e}")
+        await asyncio.sleep(60)  # Vérifier toutes les minutes
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(auto_publish_scheduled_articles())
+    logger.info("Tâche auto-publication démarrée ✅")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 # Compression GZip automatique — réduit la taille des réponses JSON de ~70%
 # Les navigateurs modernes envoient Accept-Encoding: gzip automatiquement
 app.add_middleware(GZipMiddleware, minimum_size=500)
@@ -287,6 +315,8 @@ class BlogArticleBase(BaseModel):
     category: str  # Blog category slug
     tags: List[str] = []
     is_published: bool = True
+    scheduled_at: Optional[str] = None  # Date de publication programmée
+    scheduled_at: Optional[str] = None  # Date de publication programmée (ISO format)
     related_tops: List[str] = []  # Related Top 10 article slugs
     show_on_homepage: bool = False
 
@@ -357,13 +387,25 @@ async def get_articles(
     response: Response,
     category: Optional[str] = None,
     featured: Optional[bool] = None,
-    limit: int = Query(default=20, le=100)
+    limit: int = Query(default=20, le=100),
+    admin: Optional[bool] = None
 ):
+    now = datetime.now(timezone.utc)
     query = {}
     if category:
         query["category"] = category
     if featured is not None:
         query["is_featured"] = featured
+    
+    # Mode admin : retourner tous les articles (publiés + brouillons)
+    # Mode public : seulement les publiés et dont la date de publication est passée
+    if not admin:
+        query["is_published"] = True
+        query["$or"] = [
+            {"scheduled_at": {"$exists": False}},
+            {"scheduled_at": None},
+            {"scheduled_at": {"$lte": now.isoformat()}}
+        ]
     
     articles = await db.articles.find(query, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
     
@@ -757,10 +799,24 @@ async def seed_default_blog_categories():
 async def get_blog_articles(
     category: Optional[str] = None,
     limit: int = Query(default=20, le=100),
-    offset: int = 0
+    offset: int = 0,
+    admin: Optional[bool] = None
 ):
     """Get all blog articles"""
-    query = {"is_published": True}
+    now = datetime.now(timezone.utc).isoformat()
+    if admin:
+        # Mode admin : tous les articles
+        query = {}
+    else:
+        # Mode public : uniquement publiés et date passée
+        query = {
+            "is_published": True,
+            "$or": [
+                {"scheduled_at": {"$exists": False}},
+                {"scheduled_at": None},
+                {"scheduled_at": {"$lte": now}}
+            ]
+        }
     if category:
         query["category"] = category
     
