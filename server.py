@@ -16,6 +16,13 @@ import re
 import jwt
 import hashlib
 import asyncio
+from collections import defaultdict
+try:
+    from PIL import Image
+    import io
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 import shutil
 import httpx
 
@@ -32,6 +39,27 @@ db = client[os.environ['DB_NAME']]
 
 # Create the main app without a prefix
 from starlette.middleware.gzip import GZipMiddleware
+
+# ==================== RATE LIMITER ====================
+# Stockage en mémoire : {ip: [timestamps]}
+_rate_limit_store = defaultdict(list)
+
+def check_rate_limit(request: Request, max_requests: int = 5, window_seconds: int = 60):
+    """Vérifie et applique le rate limiting par IP"""
+    ip = request.client.host if request.client else "unknown"
+    now = datetime.now(timezone.utc).timestamp()
+    window_start = now - window_seconds
+    
+    # Nettoyer les anciennes entrées
+    _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if t > window_start]
+    
+    if len(_rate_limit_store[ip]) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Trop de tentatives. Réessayez dans {window_seconds} secondes."
+        )
+    
+    _rate_limit_store[ip].append(now)
 
 async def auto_publish_scheduled_articles():
     """Publier automatiquement les articles dont la date programmée est passée"""
@@ -493,23 +521,49 @@ async def get_homepage_content():
 
 @api_router.get("/articles/search")
 async def search_articles(q: str = Query(..., min_length=2)):
+    now = datetime.now(timezone.utc).isoformat()
     regex_pattern = {"$regex": q, "$options": "i"}
-    query = {
+    
+    # Recherche dans les classements TOP
+    top_query = {
         "$or": [
             {"title": regex_pattern},
             {"introduction": regex_pattern},
             {"category": regex_pattern}
         ]
     }
-    articles = await db.articles.find(query, {"_id": 0}).limit(20).to_list(20)
-    
+    articles = await db.articles.find(top_query, {"_id": 0}).limit(10).to_list(10)
     for article in articles:
         if isinstance(article.get('created_at'), str):
             article['created_at'] = datetime.fromisoformat(article['created_at'])
         if isinstance(article.get('updated_at'), str):
             article['updated_at'] = datetime.fromisoformat(article['updated_at'])
+        article['_type'] = 'top'
     
-    return articles
+    # Recherche dans les articles blog (publiés uniquement)
+    blog_query = {
+        "is_published": True,
+        "$or": [
+            {"scheduled_at": {"$exists": False}},
+            {"scheduled_at": None},
+            {"scheduled_at": {"$lte": now}}
+        ],
+        "$or": [
+            {"title": regex_pattern},
+            {"excerpt": regex_pattern},
+            {"category": regex_pattern},
+            {"tags": regex_pattern}
+        ]
+    }
+    blog_articles = await db.blog_articles.find(blog_query, {"_id": 0}).limit(10).to_list(10)
+    for article in blog_articles:
+        if isinstance(article.get('created_at'), str):
+            article['created_at'] = datetime.fromisoformat(article['created_at'])
+        if isinstance(article.get('updated_at'), str):
+            article['updated_at'] = datetime.fromisoformat(article['updated_at'])
+        article['_type'] = 'blog'
+    
+    return {"tops": articles, "blog": blog_articles}
 
 @api_router.get("/articles/category/{category}", response_model=List[Article])
 async def get_articles_by_category(category: str):
@@ -910,7 +964,8 @@ async def get_popular_tops(limit: int = 5):
 # ==================== NEWSLETTER ====================
 
 @api_router.post("/newsletter/subscribe")
-async def subscribe_newsletter(data: NewsletterSubscribe):
+async def subscribe_newsletter(data: NewsletterSubscribe, request: Request):
+    check_rate_limit(request, max_requests=3, window_seconds=300)
     """Subscribe to newsletter"""
     # Validate email format
     email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
@@ -1041,17 +1096,36 @@ async def upload_image(file: UploadFile = File(...), authenticated: bool = Depen
     filename = f"{uuid.uuid4()}.{ext}"
     filepath = UPLOAD_DIR / filename
     
+    # Compression avec Pillow si disponible
+    original_size = len(contents)
+    if PIL_AVAILABLE and file.content_type in ["image/jpeg", "image/png", "image/webp"]:
+        try:
+            img = Image.open(io.BytesIO(contents))
+            # Redimensionner si trop grande (max 1200px de large)
+            if img.width > 1200:
+                ratio = 1200 / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((1200, new_height), Image.LANCZOS)
+            # Convertir en WebP pour meilleure compression
+            filename = f"{uuid.uuid4()}.webp"
+            filepath = UPLOAD_DIR / filename
+            output = io.BytesIO()
+            img.convert("RGB").save(output, format="WEBP", quality=82, optimize=True)
+            contents = output.getvalue()
+        except Exception as e:
+            logger.warning(f"Compression échouée, sauvegarde originale: {e}")
+
     # Save file
     with open(filepath, "wb") as f:
         f.write(contents)
     
-    # Return URL
-    # In production, this would be a CDN URL
     return {
         "success": True,
         "filename": filename,
         "url": f"/api/uploads/{filename}",
-        "size": len(contents)
+        "size": len(contents),
+        "original_size": original_size,
+        "compressed": PIL_AVAILABLE
     }
 
 @api_router.get("/uploads/{filename}")
