@@ -1165,6 +1165,36 @@ class NewsletterSend(BaseModel):
     subject: str
     html_content: str
 
+@api_router.post("/newsletter/resend-confirmations")
+async def resend_confirmations(authenticated: bool = Depends(verify_token)):
+    """Renvoie l'email de confirmation à tous les abonnés non confirmés"""
+    pending = await db.newsletter.find(
+        {"is_active": True, "confirmed": {"$ne": True}, "confirm_token": {"$exists": True}},
+        {"_id": 0, "email": 1, "confirm_token": 1}
+    ).to_list(500)
+
+    sent = 0
+    failed = 0
+    for sub in pending:
+        confirm_url = f"https://theclassement.com/newsletter/confirm?token={sub['confirm_token']}"
+        html = f"""
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#050505;color:#fff;padding:32px;border-radius:12px">
+          <h2 style="color:#0057FF">Confirmez votre inscription</h2>
+          <p>Vous avez demandé à recevoir la newsletter de The Classement.<br>Cliquez sur le bouton ci-dessous pour confirmer :</p>
+          <a href="{confirm_url}" style="display:inline-block;margin:24px 0;padding:14px 32px;background:#0057FF;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold">
+            Confirmer mon inscription
+          </a>
+          <p style="color:#666;font-size:13px">Si vous n'avez pas demandé cette inscription, ignorez cet email.</p>
+        </div>
+        """
+        try:
+            await send_brevo_email(sub["email"], sub["email"].split("@")[0], "Confirmez votre inscription — The Classement", html)
+            sent += 1
+        except:
+            failed += 1
+
+    return {"sent": sent, "failed": failed, "total": len(pending)}
+
 @api_router.post("/newsletter/send")
 async def send_newsletter(data: NewsletterSend, authenticated: bool = Depends(verify_token)):
     """Envoyer une newsletter à tous les abonnés actifs (admin only)"""
@@ -1234,6 +1264,58 @@ async def send_blog_article_newsletter(article_id: str, authenticated: bool = De
 
 
 # ==================== IMAGE UPLOAD ====================
+
+@api_router.post("/contact")
+async def contact_form(data: dict):
+    """Envoie un message de contact via Brevo"""
+    name    = data.get("name", "").strip()
+    email   = data.get("email", "").strip()
+    subject = data.get("subject", "Contact - The Classement").strip()
+    message = data.get("message", "").strip()
+    honeypot = data.get("website", "")
+
+    if honeypot:
+        return {"success": True}  # Silencieux pour les bots
+    if not name or not email or not message:
+        raise HTTPException(status_code=422, detail="Champs obligatoires manquants")
+
+    html = f"""
+    <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+      <h2 style="color:#0057FF">Nouveau message de contact</h2>
+      <table style="width:100%;border-collapse:collapse">
+        <tr><td style="padding:8px;color:#666;width:120px">Nom</td><td style="padding:8px"><strong>{name}</strong></td></tr>
+        <tr><td style="padding:8px;color:#666">Email</td><td style="padding:8px"><a href="mailto:{email}">{email}</a></td></tr>
+        <tr><td style="padding:8px;color:#666">Sujet</td><td style="padding:8px">{subject}</td></tr>
+      </table>
+      <div style="margin-top:16px;padding:16px;background:#f5f5f5;border-radius:8px;white-space:pre-wrap">{message}</div>
+    </div>
+    """
+    try:
+        await send_brevo_email(
+            to_email=BREVO_SENDER_EMAIL,
+            to_name="The Classement",
+            subject=f"[Contact] {subject} — {name}",
+            html_content=html
+        )
+        # Confirmation à l'expéditeur
+        confirm_html = f"""
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <h2 style="color:#0057FF">Message bien reçu !</h2>
+          <p>Bonjour {name},</p>
+          <p>Merci pour votre message. Nous vous répondrons dans les 48h.</p>
+          <p style="color:#666;font-size:14px">The Classement — <a href="https://theclassement.com">theclassement.com</a></p>
+        </div>
+        """
+        await send_brevo_email(
+            to_email=email,
+            to_name=name,
+            subject="Votre message a bien été reçu — The Classement",
+            html_content=confirm_html
+        )
+        return {"success": True, "message": "Message envoyé avec succès"}
+    except Exception as e:
+        logger.error(f"Erreur envoi contact: {e}")
+        raise HTTPException(status_code=500, detail="Erreur lors de l'envoi")
 
 @api_router.post("/upload/image")
 async def upload_image(file: UploadFile = File(...), authenticated: bool = Depends(verify_token)):
@@ -1578,8 +1660,20 @@ def is_bot(user_agent: str) -> bool:
 
 # Sitemap under /api prefix to be accessible via ingress
 @api_router.get("/sitemap.xml", response_class=Response)
+async def sitemap_index():
+    """Sitemap index pointant vers les sous-sitemaps"""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>{SITE_URL}/api/sitemap-tops.xml</loc><lastmod>{now}</lastmod></sitemap>
+  <sitemap><loc>{SITE_URL}/api/sitemap-blog.xml</loc><lastmod>{now}</lastmod></sitemap>
+  <sitemap><loc>{SITE_URL}/api/sitemap-static.xml</loc><lastmod>{now}</lastmod></sitemap>
+</sitemapindex>'''
+    return Response(content=xml, media_type="application/xml")
+
+@api_router.get("/sitemap-tops.xml", response_class=Response)
 async def sitemap():
-    """Generate dynamic sitemap.xml"""
+    """Generate dynamic sitemap for TOP articles"""
     articles = await db.articles.find({}, {"_id": 0, "slug": 1, "updated_at": 1, "category": 1}).to_list(1000)
     blog_articles = await db.blog_articles.find({"is_published": True}, {"_id": 0, "slug": 1, "updated_at": 1}).to_list(1000)
     categories = await db.categories.find({}, {"_id": 0, "slug": 1}).to_list(100)
@@ -1677,6 +1771,57 @@ async def sitemap():
     return Response(content=xml_content, media_type="application/xml")
 
 # Prerendered pages for SEO bots - under /api prefix
+@api_router.get("/sitemap-blog.xml", response_class=Response)
+async def sitemap_blog():
+    """Sitemap articles blog + tags"""
+    SITE_URL_LOCAL = "https://theclassement.com"
+    now = datetime.now(timezone.utc)
+    xml_content = '''<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'''
+    articles = await db.blog_articles.find({"is_published": True}, {"_id": 0, "slug": 1, "updated_at": 1, "created_at": 1}).to_list(1000)
+    for art in articles:
+        updated = art.get("updated_at") or art.get("created_at") or now
+        if isinstance(updated, str):
+            try: updated = datetime.fromisoformat(updated)
+            except: updated = now
+        days_old = (now.replace(tzinfo=None) - updated.replace(tzinfo=None)).days if updated else 999
+        priority = "0.8" if days_old < 30 else ("0.7" if days_old < 90 else "0.6")
+        freq = "weekly" if days_old < 90 else "monthly"
+        updated_str = updated.strftime("%Y-%m-%d") if hasattr(updated, 'strftime') else str(now)[:10]
+        xml_content += f'''  <url>
+    <loc>{SITE_URL_LOCAL}/blog/{art["slug"]}</loc>
+    <lastmod>{updated_str}</lastmod>
+    <changefreq>{freq}</changefreq>
+    <priority>{priority}</priority>
+  </url>\n'''
+    # Tags
+    tag_pipeline = [{"$match": {"is_published": True, "tags": {"$exists": True, "$ne": []}}}, {"$unwind": "$tags"}, {"$group": {"_id": "$tags"}}]
+    tags = await db.blog_articles.aggregate(tag_pipeline).to_list(200)
+    for t in tags:
+        xml_content += f'''  <url>
+    <loc>{SITE_URL_LOCAL}/blog/tag/{t["_id"]}</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.5</priority>
+  </url>\n'''
+    xml_content += "</urlset>"
+    return Response(content=xml_content, media_type="application/xml")
+
+@api_router.get("/sitemap-static.xml", response_class=Response)
+async def sitemap_static():
+    """Sitemap pages statiques"""
+    SITE_URL_LOCAL = "https://theclassement.com"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>{SITE_URL_LOCAL}/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>
+  <url><loc>{SITE_URL_LOCAL}/blog</loc><changefreq>daily</changefreq><priority>0.9</priority></url>
+  <url><loc>{SITE_URL_LOCAL}/top-du-mois</loc><changefreq>weekly</changefreq><priority>0.8</priority></url>
+  <url><loc>{SITE_URL_LOCAL}/about</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>{SITE_URL_LOCAL}/mentions-legales</loc><changefreq>yearly</changefreq><priority>0.2</priority></url>
+  <url><loc>{SITE_URL_LOCAL}/confidentialite</loc><changefreq>yearly</changefreq><priority>0.2</priority></url>
+</urlset>'''
+    return Response(content=xml, media_type="application/xml")
+
 @api_router.get("/prerender/article/{slug}", response_class=HTMLResponse)
 async def prerender_article(slug: str, request: Request):
     """Serve pre-rendered HTML for bots"""
