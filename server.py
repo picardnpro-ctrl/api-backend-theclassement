@@ -548,12 +548,14 @@ async def search_articles(q: str = Query(..., min_length=2)):
     now = datetime.now(timezone.utc).isoformat()
     regex_pattern = {"$regex": q, "$options": "i"}
     
-    # Recherche dans les classements TOP
+    # Recherche dans les classements TOP (titre, intro, catégorie, items du classement)
     top_query = {
         "$or": [
             {"title": regex_pattern},
             {"introduction": regex_pattern},
-            {"category": regex_pattern}
+            {"category": regex_pattern},
+            {"rankings.title": regex_pattern},
+            {"rankings.description": regex_pattern}
         ]
     }
     articles = await db.articles.find(top_query, {"_id": 0}).limit(10).to_list(10)
@@ -1163,6 +1165,38 @@ async def send_article_newsletter(article_id: str, authenticated: bool = Depends
     result = await send_newsletter_to_all(subject, html)
     return result
 
+@api_router.post("/newsletter/send-blog-article/{article_id}")
+async def send_blog_article_newsletter(article_id: str, authenticated: bool = Depends(verify_token)):
+    """Envoyer un email newsletter pour un article blog"""
+    article = await db.blog_articles.find_one({"id": article_id}, {"_id": 0})
+    if not article:
+        raise HTTPException(status_code=404, detail="Article blog non trouvé")
+    
+    unsubscribe_note = "Pour vous désinscrire de cette newsletter"
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #050505; color: #ffffff; padding: 40px;">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #ffffff; font-size: 28px;">THE<span style="color: #0057FF;">CLASSEMENT</span></h1>
+      </div>
+      {"<img src='" + article.get('featured_image','') + "' style='width:100%;border-radius:8px;margin-bottom:20px;' />" if article.get('featured_image') else ""}
+      <span style="color:#0057FF;font-size:12px;text-transform:uppercase;letter-spacing:2px;">{article.get('category','')}</span>
+      <h2 style="color: #ffffff; margin-top: 8px;">{article.get('title', '')}</h2>
+      <p style="color: #A1A1AA; line-height: 1.6;">{article.get('excerpt', '')}</p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="https://theclassement.com/blog/{article.get('slug', '')}" 
+           style="background: #0057FF; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Lire l'article →
+        </a>
+      </div>
+      <p style="color: #71717A; font-size: 12px; text-align: center;">
+        {unsubscribe_note}, <a href="https://theclassement.com/unsubscribe" style="color: #0057FF;">cliquez ici</a>
+      </p>
+    </div>
+    """
+    subject = f"Nouvel article : {article.get('title', '')}"
+    result = await send_newsletter_to_all(subject, html)
+    return result
+
 
 # ==================== IMAGE UPLOAD ====================
 
@@ -1258,13 +1292,15 @@ async def get_stats_overview(authenticated: bool = Depends(verify_token)):
     
     # Top articles
     top_articles = await db.articles.find({}, {"_id": 0, "title": 1, "slug": 1, "views": 1}).sort("views", -1).limit(5).to_list(5)
+    top_blog_articles = await db.blog_articles.find({}, {"_id": 0, "title": 1, "slug": 1, "views": 1}).sort("views", -1).limit(5).to_list(5)
     
     return {
         "articles_count": articles_count,
         "blog_count": blog_count,
         "newsletter_subscribers": newsletter_count,
         "total_views": total_views,
-        "top_articles": top_articles
+        "top_articles": top_articles,
+        "top_blog_articles": top_blog_articles
     }
 
 
@@ -1507,34 +1543,42 @@ async def sitemap():
     <priority>0.8</priority>
   </url>\n'''
     
-    # Top 10 Articles
+    # Top 10 Articles — priorité selon vues et récence
+    now_ts = datetime.now(timezone.utc)
     for article in articles:
-        updated = article.get('updated_at', datetime.now(timezone.utc).isoformat())
+        updated = article.get('updated_at', now_ts.isoformat())
         if isinstance(updated, datetime):
-            updated = updated.strftime('%Y-%m-%d')
+            updated_str = updated.strftime('%Y-%m-%d')
+            days_old = (now_ts - updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else now_ts - updated).days
         else:
-            updated = updated[:10] if len(updated) > 10 else updated
-            
+            updated_str = updated[:10] if len(updated) > 10 else updated
+            days_old = 365  # fallback
+        # Articles récents (< 30j) → 0.9, moyens (< 90j) → 0.8, anciens → 0.7
+        priority = "0.9" if days_old < 30 else ("0.8" if days_old < 90 else "0.7")
+        changefreq = "weekly" if days_old < 90 else "monthly"
         xml_content += f'''  <url>
     <loc>{SITE_URL}/article/{article['slug']}</loc>
-    <lastmod>{updated}</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.9</priority>
+    <lastmod>{updated_str}</lastmod>
+    <changefreq>{changefreq}</changefreq>
+    <priority>{priority}</priority>
   </url>\n'''
-    
-    # Blog Articles
+
+    # Blog Articles — même logique
     for blog in blog_articles:
-        updated = blog.get('updated_at', datetime.now(timezone.utc).isoformat())
+        updated = blog.get('updated_at', now_ts.isoformat())
         if isinstance(updated, datetime):
-            updated = updated.strftime('%Y-%m-%d')
+            updated_str = updated.strftime('%Y-%m-%d')
+            days_old = (now_ts - updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else now_ts - updated).days
         else:
-            updated = updated[:10] if len(updated) > 10 else updated
-            
+            updated_str = updated[:10] if len(updated) > 10 else updated
+            days_old = 365
+        priority = "0.8" if days_old < 30 else ("0.7" if days_old < 90 else "0.6")
+        changefreq = "weekly" if days_old < 90 else "monthly"
         xml_content += f'''  <url>
     <loc>{SITE_URL}/blog/{blog['slug']}</loc>
-    <lastmod>{updated}</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
+    <lastmod>{updated_str}</lastmod>
+    <changefreq>{changefreq}</changefreq>
+    <priority>{priority}</priority>
   </url>\n'''
     
     # Static pages
