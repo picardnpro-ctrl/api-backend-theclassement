@@ -1317,6 +1317,7 @@ async def get_stats_overview(authenticated: bool = Depends(verify_token)):
     articles_count = await db.articles.count_documents({})
     blog_count = await db.blog_articles.count_documents({})
     newsletter_count = await db.newsletter.count_documents({"is_active": True, "confirmed": True})
+    newsletter_pending = await db.newsletter.count_documents({"is_active": True, "confirmed": {"$ne": True}})
     
     # Total views
     pipeline = [{"$group": {"_id": None, "total": {"$sum": "$views"}}}]
@@ -1328,14 +1329,26 @@ async def get_stats_overview(authenticated: bool = Depends(verify_token)):
     # Top articles
     top_articles = await db.articles.find({}, {"_id": 0, "title": 1, "slug": 1, "views": 1}).sort("views", -1).limit(5).to_list(5)
     top_blog_articles = await db.blog_articles.find({}, {"_id": 0, "title": 1, "slug": 1, "views": 1}).sort("views", -1).limit(5).to_list(5)
+
+    # Stats par catégorie
+    cat_pipeline = [
+        {"$match": {"is_published": True}},
+        {"$group": {"_id": "$category", "count": {"$sum": 1}, "views": {"$sum": "$views"}}},
+        {"$sort": {"views": -1}},
+        {"$limit": 10}
+    ]
+    category_stats = await db.articles.aggregate(cat_pipeline).to_list(10)
+    category_stats = [{"category": c["_id"], "count": c["count"], "views": c["views"]} for c in category_stats]
     
     return {
         "articles_count": articles_count,
         "blog_count": blog_count,
         "newsletter_subscribers": newsletter_count,
+        "newsletter_pending": newsletter_pending,
         "total_views": total_views,
         "top_articles": top_articles,
-        "top_blog_articles": top_blog_articles
+        "top_blog_articles": top_blog_articles,
+        "category_stats": category_stats
     }
 
 
@@ -1634,8 +1647,24 @@ async def sitemap():
     <priority>{priority}</priority>
   </url>\n'''
     
+    # Pages de tags blog
+    tag_pipeline = [
+        {"$match": {"is_published": True, "tags": {"$exists": True, "$ne": []}}},
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags"}},
+        {"$sort": {"_id": 1}}
+    ]
+    tag_results = await db.blog_articles.aggregate(tag_pipeline).to_list(200)
+    for tag_doc in tag_results:
+        tag = tag_doc["_id"]
+        xml_content += f'''  <url>
+    <loc>{SITE_URL}/blog/tag/{tag}</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.5</priority>
+  </url>\n'''
+
     # Static pages
-    static_pages = ['about', 'mentions-legales', 'confidentialite']
+    static_pages = ['about', 'mentions-legales', 'confidentialite', 'contact']
     for page in static_pages:
         xml_content += f'''  <url>
     <loc>{SITE_URL}/{page}</loc>
