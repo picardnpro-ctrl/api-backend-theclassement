@@ -446,6 +446,8 @@ async def get_articles(
     query = {}
     if category:
         query["category"] = category
+    if tag:
+        query["tags"] = {"$in": [tag]}
     if featured is not None:
         query["is_featured"] = featured
     
@@ -513,34 +515,47 @@ async def get_top_of_month_articles(response: Response):
 
 @api_router.get("/homepage/content")
 async def get_homepage_content():
-    """Get all content marked for homepage display"""
-    # Get Top 10 articles marked for homepage
-    top10_articles = await db.articles.find(
-        {"show_on_homepage": True}, 
-        {"_id": 0}
-    ).sort("updated_at", -1).to_list(20)
-    
-    for article in top10_articles:
-        if isinstance(article.get('created_at'), str):
-            article['created_at'] = datetime.fromisoformat(article['created_at'])
-        if isinstance(article.get('updated_at'), str):
-            article['updated_at'] = datetime.fromisoformat(article['updated_at'])
-    
-    # Get Blog articles marked for homepage
-    blog_articles = await db.blog_posts.find(
-        {"show_on_homepage": True, "is_published": True}, 
-        {"_id": 0}
-    ).sort("updated_at", -1).to_list(10)
-    
-    for article in blog_articles:
-        if isinstance(article.get('created_at'), str):
-            article['created_at'] = datetime.fromisoformat(article['created_at'])
-        if isinstance(article.get('updated_at'), str):
-            article['updated_at'] = datetime.fromisoformat(article['updated_at'])
-    
+    """Endpoint unique homepage — retourne tout en 1 appel"""
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    def fix_dates(docs):
+        for d in docs:
+            if isinstance(d.get('created_at'), str):
+                try: d['created_at'] = datetime.fromisoformat(d['created_at'])
+                except: pass
+            if isinstance(d.get('updated_at'), str):
+                try: d['updated_at'] = datetime.fromisoformat(d['updated_at'])
+                except: pass
+        return docs
+
+    # 1. Featured article
+    featured = await db.articles.find_one(
+        {"is_featured": True, "is_published": True}, {"_id": 0}
+    )
+    if featured:
+        fix_dates([featured])
+
+    # 2. Top du mois
+    top_of_month = await db.articles.find(
+        {"is_top_of_month": True, "is_published": True}, {"_id": 0}
+    ).sort("views", -1).limit(5).to_list(5)
+    fix_dates(top_of_month)
+
+    # 3. Tous les articles publiés (homepage sections par catégorie)
+    all_articles = await db.articles.find(
+        {"is_published": True}, {"_id": 0}
+    ).sort("updated_at", -1).limit(20).to_list(20)
+    fix_dates(all_articles)
+
+    # 4. Catégories
+    categories = await db.categories.find({}, {"_id": 0}).sort("order", 1).to_list(20)
+
     return {
-        "top10": top10_articles,
-        "blog": blog_articles
+        "featured": featured,
+        "top_of_month": top_of_month,
+        "articles": all_articles,
+        "categories": categories,
     }
 
 @api_router.get("/articles/search")
@@ -604,13 +619,23 @@ async def get_articles_by_category(category: str):
     return articles
 
 @api_router.get("/articles/{slug}", response_model=Article)
-async def get_article(slug: str):
+async def get_article(slug: str, request: Request):
     article = await db.articles.find_one({"slug": slug}, {"_id": 0})
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
     
-    # Increment view count
-    await db.articles.update_one({"slug": slug}, {"$inc": {"views": 1}})
+    # Incrémenter vues uniquement si pas déjà vu (cookie côté client géré en frontend)
+    # Le header X-View-Counted est envoyé par le frontend si déjà compté
+    already_counted = request.headers.get("X-View-Counted", "false") == "true"
+    if not already_counted:
+        await db.articles.update_one({"slug": slug}, {"$inc": {"views": 1}})
+        # Stats journalières
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.daily_stats.update_one(
+            {"date": today},
+            {"$inc": {"views": 1, "top_views": 1}},
+            upsert=True
+        )
     
     if isinstance(article.get('created_at'), str):
         article['created_at'] = datetime.fromisoformat(article['created_at'])
@@ -899,6 +924,8 @@ async def get_blog_articles(
         }
     if category:
         query["category"] = category
+    if tag:
+        query["tags"] = {"$in": [tag]}
     
     articles = await db.blog_articles.find(query, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit).to_list(limit)
     
@@ -911,14 +938,22 @@ async def get_blog_articles(
     return articles
 
 @api_router.get("/blog/articles/{slug}")
-async def get_blog_article(slug: str):
+async def get_blog_article(slug: str, request: Request):
     """Get a single blog article by slug"""
     article = await db.blog_articles.find_one({"slug": slug}, {"_id": 0})
     if not article:
         raise HTTPException(status_code=404, detail="Article non trouvé")
     
     # Increment views
-    await db.blog_articles.update_one({"slug": slug}, {"$inc": {"views": 1}})
+    already_counted_blog = request.headers.get("X-View-Counted", "false") == "true"
+    if not already_counted_blog:
+        await db.blog_articles.update_one({"slug": slug}, {"$inc": {"views": 1}})
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.daily_stats.update_one(
+            {"date": today},
+            {"$inc": {"views": 1, "blog_views": 1}},
+            upsert=True
+        )
     
     if isinstance(article.get('created_at'), str):
         article['created_at'] = datetime.fromisoformat(article['created_at'])
@@ -1303,6 +1338,24 @@ async def get_stats_overview(authenticated: bool = Depends(verify_token)):
         "top_blog_articles": top_blog_articles
     }
 
+
+# ==================== DAILY STATS ====================
+
+@api_router.get("/stats/daily")
+async def get_daily_stats(days: int = Query(default=30, le=90), authenticated: bool = Depends(verify_token)):
+    """Retourne les stats journalières des N derniers jours"""
+    from_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    stats = await db.daily_stats.find(
+        {"date": {"$gte": from_date}},
+        {"_id": 0}
+    ).sort("date", 1).to_list(days)
+    # Remplir les jours manquants avec 0
+    all_dates = []
+    for i in range(days):
+        d = (datetime.now(timezone.utc) - timedelta(days=days-1-i)).strftime("%Y-%m-%d")
+        existing = next((s for s in stats if s["date"] == d), None)
+        all_dates.append(existing or {"date": d, "views": 0, "top_views": 0, "blog_views": 0})
+    return all_dates
 
 # ==================== SEED DATA ====================
 
