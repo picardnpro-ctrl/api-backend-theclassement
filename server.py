@@ -63,20 +63,20 @@ def check_rate_limit(request: Request, max_requests: int = 5, window_seconds: in
     _rate_limit_store[ip].append(now)
 
 async def auto_publish_scheduled_articles():
-    """Publier automatiquement les articles dont la date programmée est passée"""
+    """Publier automatiquement les articles TOP et BLOG dont la date programmée est passée"""
     await asyncio.sleep(5)  # Attendre que la DB soit connectée
     while True:
         try:
             now = datetime.now(timezone.utc).isoformat()
-            result = await db.articles.update_many(
-                {
-                    "is_published": False,
-                    "scheduled_at": {"$ne": None, "$lte": now}
-                },
-                {"$set": {"is_published": True}}
-            )
-            if result.modified_count > 0:
-                logger.info(f"{result.modified_count} article(s) publiés automatiquement")
+            filter_q = {"is_published": False, "scheduled_at": {"$ne": None, "$lte": now}}
+            update_q = {"$set": {"is_published": True}}
+            # TOP 10 articles
+            r1 = await db.articles.update_many(filter_q, update_q)
+            # Blog articles
+            r2 = await db.blog_articles.update_many(filter_q, update_q)
+            total = r1.modified_count + r2.modified_count
+            if total > 0:
+                logger.info(f"{total} article(s) publiés automatiquement (TOP:{r1.modified_count} BLOG:{r2.modified_count})")
         except Exception as e:
             logger.error(f"Erreur auto-publish: {e}")
         await asyncio.sleep(60)  # Vérifier toutes les minutes
@@ -338,6 +338,8 @@ class ArticleBase(BaseModel):
     is_featured: bool = False
     show_on_homepage: bool = False
     is_top_of_month: bool = False
+    is_published: bool = True           # False = brouillon
+    scheduled_at: Optional[str] = None  # ISO date → publication automatique
 
 class ArticleCreate(ArticleBase):
     pass
@@ -352,6 +354,8 @@ class ArticleUpdate(BaseModel):
     is_featured: Optional[bool] = None
     show_on_homepage: Optional[bool] = None
     is_top_of_month: Optional[bool] = None
+    is_published: Optional[bool] = None
+    scheduled_at: Optional[str] = None
 
 class Article(ArticleBase):
     model_config = ConfigDict(extra="ignore")
@@ -429,6 +433,7 @@ class BlogArticleUpdate(BaseModel):
     category: Optional[str] = None
     tags: Optional[List[str]] = None
     is_published: Optional[bool] = None
+    scheduled_at: Optional[str] = None  # FIX : était manquant → programmation impossible
     related_tops: Optional[List[str]] = None
     show_on_homepage: Optional[bool] = None
 
